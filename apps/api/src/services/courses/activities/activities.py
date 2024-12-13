@@ -1,34 +1,20 @@
 from typing import Literal
-from pydantic import BaseModel
+from sqlmodel import Session, select
+from src.db.courses.courses import Course
+from src.db.courses.chapters import Chapter
 from src.security.rbac.rbac import (
-    authorization_verify_based_on_roles,
+    authorization_verify_based_on_roles_and_authorship,
     authorization_verify_if_element_is_public,
     authorization_verify_if_user_is_anon,
 )
-from src.services.users.schemas.users import AnonymousUser, PublicUser
-from fastapi import HTTPException, status, Request
+from src.db.courses.activities import ActivityCreate, Activity, ActivityRead, ActivityUpdate
+from src.db.courses.chapter_activities import ChapterActivity
+from src.db.users import AnonymousUser, PublicUser
+from fastapi import HTTPException, Request
 from uuid import uuid4
 from datetime import datetime
 
-#### Classes ####################################################
-
-
-class Activity(BaseModel):
-    name: str
-    type: str
-    content: object
-
-
-class ActivityInDB(Activity):
-    activity_id: str
-    course_id: str
-    coursechapter_id: str
-    org_id: str
-    creationDate: str
-    updateDate: str
-
-
-#### Classes ####################################################
+from src.services.payments.payments_access import check_activity_paid_access
 
 
 ####################################################
@@ -38,147 +24,215 @@ class ActivityInDB(Activity):
 
 async def create_activity(
     request: Request,
-    activity_object: Activity,
-    org_id: str,
-    coursechapter_id: str,
-    current_user: PublicUser,
+    activity_object: ActivityCreate,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
 ):
-    activities = request.app.db["activities"]
-    courses = request.app.db["courses"]
-    users = request.app.db["users"]
 
-    # get user
-    user = await users.find_one({"user_id": current_user.user_id})
+    # CHeck if org exists
+    statement = select(Chapter).where(Chapter.id == activity_object.chapter_id)
+    chapter = db_session.exec(statement).first()
 
-    # generate activity_id
-    activity_id = str(f"activity_{uuid4()}")
+    if not chapter:
+        raise HTTPException(
+            status_code=404,
+            detail="Chapter not found",
+        )
 
-    # verify activity rights
-    await authorization_verify_based_on_roles(
-        request,
-        current_user.user_id,
-        "create",
-        user["roles"],
-        activity_id,
+    # RBAC check
+    await rbac_check(request, chapter.chapter_uuid, current_user, "create", db_session)
+
+    # Create Activity
+    activity = Activity(**activity_object.model_dump())
+
+    activity.activity_uuid = str(f"activity_{uuid4()}")
+    activity.creation_date = str(datetime.now())
+    activity.update_date = str(datetime.now())
+    activity.org_id = chapter.org_id
+    activity.course_id = chapter.course_id
+
+    # Insert Activity in DB
+    db_session.add(activity)
+    db_session.commit()
+    db_session.refresh(activity)
+
+    # Find the last activity in the Chapter and add it to the list
+    statement = (
+        select(ChapterActivity)
+        .where(ChapterActivity.chapter_id == activity_object.chapter_id)
+        .order_by(ChapterActivity.order) # type: ignore
+    )
+    chapter_activities = db_session.exec(statement).all()
+
+    last_order = chapter_activities[-1].order if chapter_activities else 0
+    to_be_used_order = last_order + 1
+
+    # Add activity to chapter
+    activity_chapter = ChapterActivity(
+        chapter_id=activity_object.chapter_id,
+        activity_id=activity.id if activity.id else 0,
+        course_id=chapter.course_id,
+        org_id=chapter.org_id,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+        order=to_be_used_order,
     )
 
-    # get course_id from activity
-    course = await courses.find_one({"chapters": coursechapter_id})
+    # Insert ChapterActivity link in DB
+    db_session.add(activity_chapter)
+    db_session.commit()
+    db_session.refresh(activity_chapter)
 
-    # create activity
-    activity = ActivityInDB(
-        **activity_object.dict(),
-        creationDate=str(datetime.now()),
-        coursechapter_id=coursechapter_id,
-        updateDate=str(datetime.now()),
-        activity_id=activity_id,
-        org_id=org_id,
-        course_id=course["course_id"],
-    )
-    await activities.insert_one(activity.dict())
-
-    # update chapter
-    await courses.update_one(
-        {"chapters_content.coursechapter_id": coursechapter_id},
-        {"$addToSet": {"chapters_content.$.activities": activity_id}},
-    )
-
-    return activity
+    return ActivityRead.model_validate(activity)
 
 
-async def get_activity(request: Request, activity_id: str, current_user: PublicUser):
-    activities = request.app.db["activities"]
-    courses = request.app.db["courses"]
-
-    activity = await activities.find_one({"activity_id": activity_id})
-
-    # get course_id from activity
-    coursechapter_id = activity["coursechapter_id"]
-    await courses.find_one({"chapters": coursechapter_id})
-
-    # verify course rights
-    await verify_rights(request, activity["course_id"], current_user, "read")
+async def get_activity(
+    request: Request,
+    activity_uuid: str,
+    current_user: PublicUser,
+    db_session: Session,
+):
+    statement = select(Activity).where(Activity.activity_uuid == activity_uuid)
+    activity = db_session.exec(statement).first()
 
     if not activity:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
+            status_code=404,
+            detail="Activity not found",
         )
 
-    activity = ActivityInDB(**activity)
+    # Get course from that activity
+    statement = select(Course).where(Course.id == activity.course_id)
+    course = db_session.exec(statement).first()
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found",
+        )
+
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "read", db_session)
+
+    # Paid access check
+    has_paid_access = await check_activity_paid_access(
+        request=request,
+        activity_id=activity.id if activity.id else 0,
+        user=current_user,
+        db_session=db_session
+    )
+
+    activity_read = ActivityRead.model_validate(activity)
+    activity_read.content = activity_read.content if has_paid_access else { "paid_access": False }
+    activity = activity_read
+
+    return activity
+
+async def get_activityby_id(
+    request: Request,
+    activity_id: str,
+    current_user: PublicUser,
+    db_session: Session,
+):
+    statement = select(Activity).where(Activity.id == activity_id)
+    activity = db_session.exec(statement).first()
+
+    if not activity:
+        raise HTTPException(
+            status_code=404,
+            detail="Activity not found",
+        )
+
+    # Get course from that activity
+    statement = select(Course).where(Course.id == activity.course_id)
+    course = db_session.exec(statement).first()
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found",
+        )
+
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "read", db_session)
+
+    activity = ActivityRead.model_validate(activity)
+
     return activity
 
 
 async def update_activity(
     request: Request,
-    activity_object: Activity,
-    activity_id: str,
-    current_user: PublicUser,
+    activity_object: ActivityUpdate,
+    activity_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
 ):
-    activities = request.app.db["activities"]
-
-    activity = await activities.find_one({"activity_id": activity_id})
-
-    # verify course rights
-    await verify_rights(request, activity_id, current_user, "update")
-
-    if activity:
-        creationDate = activity["creationDate"]
-
-        # get today's date
-        datetime_object = datetime.now()
-
-        updated_course = ActivityInDB(
-            activity_id=activity_id,
-            coursechapter_id=activity["coursechapter_id"],
-            creationDate=creationDate,
-            updateDate=str(datetime_object),
-            course_id=activity["course_id"],
-            org_id=activity["org_id"],
-            **activity_object.dict(),
-        )
-
-        await activities.update_one(
-            {"activity_id": activity_id}, {"$set": updated_course.dict()}
-        )
-
-        return ActivityInDB(**updated_course.dict())
-
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="activity does not exist"
-        )
-
-
-async def delete_activity(request: Request, activity_id: str, current_user: PublicUser):
-    activities = request.app.db["activities"]
-
-    activity = await activities.find_one({"activity_id": activity_id})
-
-    # verify course rights
-    await verify_rights(request, activity_id, current_user, "delete")
+    statement = select(Activity).where(Activity.activity_uuid == activity_uuid)
+    activity = db_session.exec(statement).first()
 
     if not activity:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="activity does not exist"
+            status_code=404,
+            detail="Activity not found",
         )
 
-    # Remove Activity
-    isDeleted = await activities.delete_one({"activity_id": activity_id})
-
-    # Remove Activity from chapter
-    courses = request.app.db["courses"]
-    isDeletedFromChapter = await courses.update_one(
-        {"chapters_content.activities": activity_id},
-        {"$pull": {"chapters_content.$.activities": activity_id}},
+    # RBAC check
+    await rbac_check(
+        request, activity.activity_uuid, current_user, "update", db_session
     )
 
-    if isDeleted and isDeletedFromChapter:
-        return {"detail": "Activity deleted"}
-    else:
+    # Update only the fields that were passed in
+    for var, value in vars(activity_object).items():
+        if value is not None:
+            setattr(activity, var, value)
+
+    db_session.add(activity)
+    db_session.commit()
+    db_session.refresh(activity)
+
+    activity = ActivityRead.model_validate(activity)
+
+    return activity
+
+
+async def delete_activity(
+    request: Request,
+    activity_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
+):
+    statement = select(Activity).where(Activity.activity_uuid == activity_uuid)
+    activity = db_session.exec(statement).first()
+
+    if not activity:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unavailable database",
+            status_code=404,
+            detail="Activity not found",
         )
+
+    # RBAC check
+    await rbac_check(
+        request, activity.activity_uuid, current_user, "delete", db_session
+    )
+
+    # Delete activity from chapter
+    statement = select(ChapterActivity).where(
+        ChapterActivity.activity_id == activity.id
+    )
+    activity_chapter = db_session.exec(statement).first()
+
+    if not activity_chapter:
+        raise HTTPException(
+            status_code=404,
+            detail="Activity not found in chapter",
+        )
+
+    db_session.delete(activity_chapter)
+    db_session.delete(activity)
+    db_session.commit()
+
+    return {"detail": "Activity deleted"}
 
 
 ####################################################
@@ -187,64 +241,63 @@ async def delete_activity(request: Request, activity_id: str, current_user: Publ
 
 
 async def get_activities(
-    request: Request, coursechapter_id: str, current_user: PublicUser
-):
-    activities = request.app.db["activities"]
-
-    activities = activities.find({"coursechapter_id": coursechapter_id})
+    request: Request,
+    coursechapter_id: int,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
+) -> list[ActivityRead]:
+    statement = select(ChapterActivity).where(
+        ChapterActivity.chapter_id == coursechapter_id
+    )
+    activities = db_session.exec(statement).all()
 
     if not activities:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
+            status_code=404,
+            detail="No activities found",
         )
 
-    activities = [
-        ActivityInDB(**activity) for activity in await activities.to_list(length=100)
-    ]
+    # RBAC check
+    await rbac_check(request, "activity_x", current_user, "read", db_session)
+
+    activities = [ActivityRead.model_validate(activity) for activity in activities]
 
     return activities
 
 
-#### Security ####################################################
+## 🔒 RBAC Utils ##
 
 
-async def verify_rights(
+async def rbac_check(
     request: Request,
-    activity_id: str,  # course_id in case of read
+    element_uuid: str,
     current_user: PublicUser | AnonymousUser,
     action: Literal["create", "read", "update", "delete"],
+    db_session: Session,
 ):
+    
+
     if action == "read":
-        if current_user.user_id == "anonymous":
-            await authorization_verify_if_element_is_public(
-                request, activity_id, current_user.user_id, action
+        if current_user.id == 0:  # Anonymous user
+            res = await authorization_verify_if_element_is_public(
+                request, element_uuid, action, db_session
             )
+            return res
         else:
-            users = request.app.db["users"]
-            user = await users.find_one({"user_id": current_user.user_id})
-
-            await authorization_verify_if_user_is_anon(current_user.user_id)
-
-            await authorization_verify_based_on_roles(
-                request,
-                current_user.user_id,
-                action,
-                user["roles"],
-                activity_id,
+            res = await authorization_verify_based_on_roles_and_authorship(
+                request, current_user.id, action, element_uuid, db_session
             )
+            return res
     else:
-        users = request.app.db["users"]
-        user = await users.find_one({"user_id": current_user.user_id})
-
-        await authorization_verify_if_user_is_anon(current_user.user_id)
-
-        await authorization_verify_based_on_roles(
+        # For non-read actions, proceed with regular RBAC checks
+        await authorization_verify_if_user_is_anon(current_user.id)
+        await authorization_verify_based_on_roles_and_authorship(
             request,
-            current_user.user_id,
+            current_user.id,
             action,
-            user["roles"],
-            activity_id,
+            element_uuid,
+            db_session,
         )
 
 
-#### Security ####################################################
+## 🔒 RBAC Utils ##

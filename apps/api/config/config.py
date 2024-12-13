@@ -1,7 +1,8 @@
-from typing import Literal, Optional
-from pydantic import BaseModel
 import os
 import yaml
+from typing import Literal, Optional
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
 
 class SentryConfig(BaseModel):
@@ -23,6 +24,17 @@ class SecurityConfig(BaseModel):
     auth_jwt_secret_key: str
 
 
+class ChromaDBConfig(BaseModel):
+    isSeparateDatabaseEnabled: bool | None 
+    db_host: str | None 
+
+
+class AIConfig(BaseModel):
+    openai_api_key: str | None
+    is_ai_enabled: bool | None
+    chromadb_config: ChromaDBConfig | None
+
+
 class S3ApiConfig(BaseModel):
     bucket_name: str | None
     endpoint_url: str | None
@@ -36,6 +48,7 @@ class ContentDeliveryConfig(BaseModel):
 class HostingConfig(BaseModel):
     domain: str
     ssl: bool
+    port: int
     use_default_org: bool
     allowed_origins: list
     allowed_regexp: str
@@ -45,8 +58,29 @@ class HostingConfig(BaseModel):
     content_delivery: ContentDeliveryConfig
 
 
+class MailingConfig(BaseModel):
+    resend_api_key: str
+    system_email_address: str
+
+
 class DatabaseConfig(BaseModel):
-    mongodb_connection_string: Optional[str]
+    sql_connection_string: Optional[str]
+
+
+class RedisConfig(BaseModel):
+    redis_connection_string: Optional[str]
+
+
+class InternalStripeConfig(BaseModel):
+    stripe_secret_key: str | None
+    stripe_publishable_key: str | None
+    stripe_webhook_standard_secret: str | None
+    stripe_webhook_connect_secret: str | None
+    stripe_client_id: str | None
+
+
+class InternalPaymentsConfig(BaseModel):
+    stripe: InternalStripeConfig
 
 
 class LearnHouseConfig(BaseModel):
@@ -56,10 +90,17 @@ class LearnHouseConfig(BaseModel):
     general_config: GeneralConfig
     hosting_config: HostingConfig
     database_config: DatabaseConfig
+    redis_config: RedisConfig
     security_config: SecurityConfig
+    ai_config: AIConfig
+    mailing_config: MailingConfig
+    payments_config: InternalPaymentsConfig
 
 
 def get_learnhouse_config() -> LearnHouseConfig:
+
+    load_dotenv()
+
     # Get the YAML file
     yaml_path = os.path.join(os.path.dirname(__file__), "config.yaml")
 
@@ -97,17 +138,17 @@ def get_learnhouse_config() -> LearnHouseConfig:
     env_domain = os.environ.get("LEARNHOUSE_DOMAIN")
     os.environ.get("LEARNHOUSE_PORT")
     env_ssl = os.environ.get("LEARNHOUSE_SSL")
+    env_port = os.environ.get("LEARNHOUSE_PORT")
     env_use_default_org = os.environ.get("LEARNHOUSE_USE_DEFAULT_ORG")
     env_allowed_origins = os.environ.get("LEARNHOUSE_ALLOWED_ORIGINS")
     env_cookie_domain = os.environ.get("LEARNHOUSE_COOKIE_DOMAIN")
+
     # Allowed origins should be a comma separated string
     if env_allowed_origins:
         env_allowed_origins = env_allowed_origins.split(",")
     env_allowed_regexp = os.environ.get("LEARNHOUSE_ALLOWED_REGEXP")
     env_self_hosted = os.environ.get("LEARNHOUSE_SELF_HOSTED")
-    env_mongodb_connection_string = os.environ.get(
-        "LEARNHOUSE_MONGODB_CONNECTION_STRING"
-    )
+    env_sql_connection_string = os.environ.get("LEARNHOUSE_SQL_CONNECTION_STRING")
 
     # Sentry Config
     env_sentry_dsn = os.environ.get("LEARNHOUSE_SENTRY_DSN")
@@ -121,6 +162,7 @@ def get_learnhouse_config() -> LearnHouseConfig:
 
     domain = env_domain or yaml_config.get("hosting_config", {}).get("domain")
     ssl = env_ssl or yaml_config.get("hosting_config", {}).get("ssl")
+    port = env_port or yaml_config.get("hosting_config", {}).get("port")
     use_default_org = env_use_default_org or yaml_config.get("hosting_config", {}).get(
         "use_default_org"
     )
@@ -166,9 +208,44 @@ def get_learnhouse_config() -> LearnHouseConfig:
     )
 
     # Database config
-    mongodb_connection_string = env_mongodb_connection_string or yaml_config.get(
+    sql_connection_string = env_sql_connection_string or yaml_config.get(
         "database_config", {}
-    ).get("mongodb_connection_string")
+    ).get("sql_connection_string")
+
+    # AI Config
+    env_openai_api_key = os.environ.get("LEARNHOUSE_OPENAI_API_KEY")
+    env_is_ai_enabled = os.environ.get("LEARNHOUSE_IS_AI_ENABLED")
+    env_chromadb_separate = os.environ.get("LEARNHOUSE_CHROMADB_SEPARATE")
+    env_chromadb_host = os.environ.get("LEARNHOUSE_CHROMADB_HOST")
+
+    openai_api_key = env_openai_api_key or yaml_config.get("ai_config", {}).get(
+        "openai_api_key"
+    )
+    is_ai_enabled = env_is_ai_enabled or yaml_config.get("ai_config", {}).get(
+        "is_ai_enabled"
+    )
+    chromadb_separate = env_chromadb_separate or yaml_config.get("ai_config", {}).get(
+        "chromadb_config", {}
+    ).get("isSeparateDatabaseEnabled")
+    chromadb_host = env_chromadb_host or yaml_config.get("ai_config", {}).get(
+        "chromadb_config", {}
+    ).get("db_host")
+
+    # Redis config
+    env_redis_connection_string = os.environ.get("LEARNHOUSE_REDIS_CONNECTION_STRING")
+    redis_connection_string = env_redis_connection_string or yaml_config.get(
+        "redis_config", {}
+    ).get("redis_connection_string")
+
+    # Mailing config
+    env_resend_api_key = os.environ.get("LEARNHOUSE_RESEND_API_KEY")
+    env_system_email_address = os.environ.get("LEARNHOUSE_SYSTEM_EMAIL_ADDRESS")
+    resend_api_key = env_resend_api_key or yaml_config.get("mailing_config", {}).get(
+        "resend_api_key"
+    )
+    system_email_address = env_system_email_address or yaml_config.get(
+        "mailing_config", {}
+    ).get("system_email_adress")
 
     # Sentry config
     # check if the sentry config is provided in the YAML file
@@ -197,10 +274,38 @@ def get_learnhouse_config() -> LearnHouseConfig:
     else:
         sentry_config = None
 
+    # Payments config
+    env_stripe_secret_key = os.environ.get("LEARNHOUSE_STRIPE_SECRET_KEY")
+    env_stripe_publishable_key = os.environ.get("LEARNHOUSE_STRIPE_PUBLISHABLE_KEY")
+    env_stripe_webhook_standard_secret = os.environ.get("LEARNHOUSE_STRIPE_WEBHOOK_STANDARD_SECRET")
+    env_stripe_webhook_connect_secret = os.environ.get("LEARNHOUSE_STRIPE_WEBHOOK_CONNECT_SECRET")
+    env_stripe_client_id = os.environ.get("LEARNHOUSE_STRIPE_CLIENT_ID")
+    
+    stripe_secret_key = env_stripe_secret_key or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_secret_key")
+    
+    stripe_publishable_key = env_stripe_publishable_key or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_publishable_key")
+
+    stripe_webhook_standard_secret = env_stripe_webhook_standard_secret or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_webhook_standard_secret")
+
+    stripe_webhook_connect_secret = env_stripe_webhook_connect_secret or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_webhook_connect_secret")
+
+    stripe_client_id = env_stripe_client_id or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_client_id")
+
     # Create HostingConfig and DatabaseConfig objects
     hosting_config = HostingConfig(
         domain=domain,
         ssl=bool(ssl),
+        port=int(port),
         use_default_org=bool(use_default_org),
         allowed_origins=list(allowed_origins),
         allowed_regexp=allowed_regexp,
@@ -210,7 +315,16 @@ def get_learnhouse_config() -> LearnHouseConfig:
         content_delivery=content_delivery,
     )
     database_config = DatabaseConfig(
-        mongodb_connection_string=mongodb_connection_string
+        sql_connection_string=sql_connection_string,
+    )
+
+    # AI Config
+    ai_config = AIConfig(
+        openai_api_key=openai_api_key,
+        is_ai_enabled=bool(is_ai_enabled),
+        chromadb_config=ChromaDBConfig(
+            isSeparateDatabaseEnabled=bool(chromadb_separate), db_host=chromadb_host
+        ),
     )
 
     # Create LearnHouseConfig object
@@ -224,6 +338,20 @@ def get_learnhouse_config() -> LearnHouseConfig:
         hosting_config=hosting_config,
         database_config=database_config,
         security_config=SecurityConfig(auth_jwt_secret_key=auth_jwt_secret_key),
+        ai_config=ai_config,
+        redis_config=RedisConfig(redis_connection_string=redis_connection_string),
+        mailing_config=MailingConfig(
+            resend_api_key=resend_api_key, system_email_address=system_email_address
+        ),
+        payments_config=InternalPaymentsConfig(
+            stripe=InternalStripeConfig(
+                stripe_secret_key=stripe_secret_key,
+                stripe_publishable_key=stripe_publishable_key,
+                stripe_webhook_standard_secret=stripe_webhook_standard_secret,
+                stripe_webhook_connect_secret=stripe_webhook_connect_secret,
+                stripe_client_id=stripe_client_id
+            )
+        )
     )
 
     return config

@@ -1,35 +1,34 @@
 from datetime import datetime
+import json
 from uuid import uuid4
-from fastapi import HTTPException, Request, status
-from pydantic import BaseModel
-import requests
+from fastapi import HTTPException, Request
+from sqlalchemy import desc
+from sqlmodel import Session, select
+from src.db.install import Install, InstallRead
+from src.db.organization_config import (
+    AIOrgConfig,
+    APIOrgConfig,
+    AnalyticsOrgConfig,
+    AssignmentOrgConfig,
+    CollaborationOrgConfig,
+    CourseOrgConfig,
+    DiscussionOrgConfig,
+    MemberOrgConfig,
+    OrgCloudConfig,
+    OrgFeatureConfig,
+    OrgGeneralConfig,
+    OrganizationConfig,
+    OrganizationConfigBase,
+    PaymentOrgConfig,
+    StorageOrgConfig,
+    UserGroupOrgConfig,
+)
+from src.db.organizations import Organization, OrganizationCreate
+from src.db.roles import Permission, Rights, Role, RoleTypeEnum
+from src.db.user_organizations import UserOrganization
+from src.db.users import User, UserCreate, UserRead
 from config.config import get_learnhouse_config
 from src.security.security import security_hash_password
-from src.services.courses.activities.activities import Activity, create_activity
-from src.services.courses.chapters import create_coursechapter, CourseChapter
-from src.services.courses.courses import CourseInDB
-
-from src.services.orgs.schemas.orgs import Organization, OrganizationInDB
-from faker import Faker
-
-
-from src.services.roles.schemas.roles import Elements, Permission, RoleInDB
-from src.services.users.schemas.users import (
-    PublicUser,
-    User,
-    UserInDB,
-    UserOrganization,
-    UserRolesInOrganization,
-    UserWithPassword,
-)
-
-
-class InstallInstance(BaseModel):
-    install_id: str
-    created_date: str
-    updated_date: str
-    step: int
-    data: dict
 
 
 async def isInstallModeEnabled():
@@ -44,37 +43,31 @@ async def isInstallModeEnabled():
         )
 
 
-async def create_install_instance(request: Request, data: dict):
-    installs = request.app.db["installs"]
+async def create_install_instance(request: Request, data: dict, db_session: Session):
+    install = Install.model_validate(data)
 
-    # get install_id
-    install_id = str(f"install_{uuid4()}")
-    created_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    updated_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    step = 1
+    # complete install instance
+    install.install_uuid = str(f"install_{uuid4()}")
+    install.update_date = str(datetime.now())
+    install.creation_date = str(datetime.now())
+    install.step = 1
+    # insert install instance
+    db_session.add(install)
 
-    # create install
-    install = InstallInstance(
-        install_id=install_id,
-        created_date=created_date,
-        updated_date=updated_date,
-        step=step,
-        data=data,
-    )
+    # commit changes
+    db_session.commit()
 
-    # insert install
-    installs.insert_one(install.dict())
+    # refresh install instance
+    db_session.refresh(install)
+
+    install = InstallRead.model_validate(install)
 
     return install
 
 
-async def get_latest_install_instance(request: Request):
-    installs = request.app.db["installs"]
-
-    # get latest created install instance using find_one
-    install = await installs.find_one(
-        sort=[("created_date", -1)], limit=1, projection={"_id": 0}
-    )
+async def get_latest_install_instance(request: Request, db_session: Session):
+    statement = select(Install).order_by(desc(Install.creation_date)).limit(1)
+    install = db_session.exec(statement).first()
 
     if install is None:
         raise HTTPException(
@@ -82,37 +75,35 @@ async def get_latest_install_instance(request: Request):
             detail="No install instance found",
         )
 
-    else:
-        install = InstallInstance(**install)
+    install = InstallRead.model_validate(install)
 
-        return install
+    return install
 
 
-async def update_install_instance(request: Request, data: dict, step: int):
-    installs = request.app.db["installs"]
-
-    # get latest created install
-    install = await installs.find_one(
-        sort=[("created_date", -1)], limit=1, projection={"_id": 0}
-    )
+async def update_install_instance(
+    request: Request, data: dict, step: int, db_session: Session
+):
+    statement = select(Install).order_by(desc(Install.creation_date)).limit(1)
+    install = db_session.exec(statement).first()
 
     if install is None:
-        return None
-
-    else:
-        # update install
-        install["data"] = data
-        install["step"] = step
-        install["updated_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # update install
-        await installs.update_one(
-            {"install_id": install["install_id"]}, {"$set": install}
+        raise HTTPException(
+            status_code=404,
+            detail="No install instance found",
         )
 
-        install = InstallInstance(**install)
+    install.step = step
+    install.data = data
 
-        return install
+    # commit changes
+    db_session.commit()
+
+    # refresh install instance
+    db_session.refresh(install)
+
+    install = InstallRead.model_validate(install)
+
+    return install
 
 
 ############################################################################################################
@@ -121,24 +112,35 @@ async def update_install_instance(request: Request, data: dict, step: int):
 
 
 # Install Default roles
-async def install_default_elements(request: Request, data: dict):
-    roles = request.app.db["roles"]
+def install_default_elements(db_session: Session):
+    """ """
+    # remove all default roles
+    statement = select(Role).where(Role.role_type == RoleTypeEnum.TYPE_GLOBAL)
+    roles = db_session.exec(statement).all()
 
-    # check if default roles ADMIN_ROLE and USER_ROLE already exist
-    admin_role = await roles.find_one({"role_id": "role_admin"})
-    user_role = await roles.find_one({"role_id": "role_member"})
+    for role in roles:
+        db_session.delete(role)
 
-    if admin_role is not None or user_role is not None:
+    db_session.commit()
+
+    # Check if default roles already exist
+    statement = select(Role).where(Role.role_type == RoleTypeEnum.TYPE_GLOBAL)
+    roles = db_session.exec(statement).all()
+
+    if roles and len(roles) == 3:
         raise HTTPException(
-            status_code=400,
+            status_code=409,
             detail="Default roles already exist",
         )
 
-    # get default roles
-    ADMIN_ROLE = RoleInDB(
-        name="Admin Role",
-        description="This role grants all permissions to the user",
-        elements=Elements(
+    # Create default roles
+    role_global_admin = Role(
+        name="Admin",
+        description="Standard Admin Role",
+        id=1,
+        role_type=RoleTypeEnum.TYPE_GLOBAL,
+        role_uuid="role_global_admin",
+        rights=Rights(
             courses=Permission(
                 action_create=True,
                 action_read=True,
@@ -151,7 +153,7 @@ async def install_default_elements(request: Request, data: dict):
                 action_update=True,
                 action_delete=True,
             ),
-            houses=Permission(
+            usergroups=Permission(
                 action_create=True,
                 action_read=True,
                 action_update=True,
@@ -182,16 +184,71 @@ async def install_default_elements(request: Request, data: dict):
                 action_delete=True,
             ),
         ),
-        org_id="*",
-        role_id="role_admin",
-        created_at=str(datetime.now()),
-        updated_at=str(datetime.now()),
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
     )
 
-    USER_ROLE = RoleInDB(
-        name="Member Role",
-        description="This role grants read-only permissions to the user",
-        elements=Elements(
+    role_global_maintainer = Role(
+        name="Maintainer",
+        description="Standard Maintainer Role",
+        id=2,
+        role_type=RoleTypeEnum.TYPE_GLOBAL,
+        role_uuid="role_global_maintainer",
+        rights=Rights(
+            courses=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+            users=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+            usergroups=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+            collections=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+            organizations=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+            coursechapters=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+            activities=Permission(
+                action_create=True,
+                action_read=True,
+                action_update=True,
+                action_delete=True,
+            ),
+        ),
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+
+    role_global_user = Role(
+        name="User",
+        description="Standard User Role",
+        role_type=RoleTypeEnum.TYPE_GLOBAL,
+        role_uuid="role_global_user",
+        id=3,
+        rights=Rights(
             courses=Permission(
                 action_create=False,
                 action_read=True,
@@ -199,12 +256,12 @@ async def install_default_elements(request: Request, data: dict):
                 action_delete=False,
             ),
             users=Permission(
-                action_create=False,
+                action_create=True,
                 action_read=True,
                 action_update=False,
                 action_delete=False,
             ),
-            houses=Permission(
+            usergroups=Permission(
                 action_create=False,
                 action_read=True,
                 action_update=False,
@@ -235,185 +292,161 @@ async def install_default_elements(request: Request, data: dict):
                 action_delete=False,
             ),
         ),
-        org_id="*",
-        role_id="role_member",
-        created_at=str(datetime.now()),
-        updated_at=str(datetime.now()),
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
     )
 
-    try:
-        # insert default roles
-        await roles.insert_many([USER_ROLE.dict(), ADMIN_ROLE.dict()])
-        return True
+    # Serialize rights to JSON
+    role_global_admin.rights = role_global_admin.rights.dict()  # type: ignore
+    role_global_maintainer.rights = role_global_maintainer.rights.dict()  # type: ignore
+    role_global_user.rights = role_global_user.rights.dict()  # type: ignore
 
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Error while inserting default roles",
-        )
+    # Insert roles in DB
+    db_session.add(role_global_admin)
+    db_session.add(role_global_maintainer)
+    db_session.add(role_global_user)
+
+    # commit changes
+    db_session.commit()
+
+    # refresh roles
+    db_session.refresh(role_global_admin)
+
+    return True
 
 
 # Organization creation
-async def install_create_organization(
-    request: Request,
-    org_object: Organization,
-):
-    orgs = request.app.db["organizations"]
-    request.app.db["users"]
+def install_create_organization(org_object: OrganizationCreate, db_session: Session):
+    org = Organization.model_validate(org_object)
 
-    # find if org already exists using name
+    # Complete the org object
+    org.org_uuid = f"org_{uuid4()}"
+    org.creation_date = str(datetime.now())
+    org.update_date = str(datetime.now())
 
-    isOrgAvailable = await orgs.find_one({"slug": org_object.slug.lower()})
+    db_session.add(org)
+    db_session.commit()
+    db_session.refresh(org)
 
-    if isOrgAvailable:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Organization slug already exists",
+    # Org Config
+    org_config = OrganizationConfigBase(
+        config_version="1.2",
+        general=OrgGeneralConfig(
+            enabled=True,
+            color="normal",
+            watermark=True,
+        ),
+        features=OrgFeatureConfig(
+            courses=CourseOrgConfig(enabled=True, limit=0),
+            members=MemberOrgConfig(
+                enabled=True, signup_mode="open", admin_limit=0, limit=0
+            ),
+            usergroups=UserGroupOrgConfig(enabled=True, limit=0),
+            storage=StorageOrgConfig(enabled=True, limit=0),
+            ai=AIOrgConfig(enabled=True, limit=0, model="gpt-4o-mini"),
+            assignments=AssignmentOrgConfig(enabled=True, limit=0),
+            payments=PaymentOrgConfig(enabled=False),
+            discussions=DiscussionOrgConfig(enabled=True, limit=0),
+            analytics=AnalyticsOrgConfig(enabled=True, limit=0),
+            collaboration=CollaborationOrgConfig(enabled=True, limit=0),
+            api=APIOrgConfig(enabled=True, limit=0),
+        ),
+        cloud=OrgCloudConfig(
+            plan='free',
+            custom_domain=False
         )
+    )
 
-    # generate org_id with uuid4
-    org_id = str(f"org_{uuid4()}")
+    org_config = json.loads(org_config.json())
 
-    org = OrganizationInDB(org_id=org_id, **org_object.dict())
-
-    org_in_db = await orgs.insert_one(org.dict())
-
-    if not org_in_db:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unavailable database",
-        )
-
-    return org.dict()
-
-
-async def install_create_organization_user(
-    request: Request, user_object: UserWithPassword, org_slug: str
-):
-    users = request.app.db["users"]
-
-    isUsernameAvailable = await users.find_one({"username": user_object.username})
-    isEmailAvailable = await users.find_one({"email": user_object.email})
-
-    if isUsernameAvailable:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Username already exists"
-        )
-
-    if isEmailAvailable:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Email already exists"
-        )
-
-    # Generate user_id with uuid4
-    user_id = str(f"user_{uuid4()}")
-
-    # Set the username & hash the password
-    user_object.username = user_object.username.lower()
-    user_object.password = await security_hash_password(user_object.password)
-
-    # Get org_id from org_slug
-    orgs = request.app.db["organizations"]
-
-    # Check if the org exists
-    isOrgExists = await orgs.find_one({"slug": org_slug})
-
-    # If the org does not exist, raise an error
-    if not isOrgExists:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="You are trying to create a user in an organization that does not exist",
-        )
-
-    org_id = isOrgExists["org_id"]
-
-    # Create initial orgs list with the org_id passed in
-    orgs = [UserOrganization(org_id=org_id, org_role="owner")]
-
-    # Give role
-    roles = [UserRolesInOrganization(role_id="role_admin", org_id=org_id)]
-
-    # Create the user
-    user = UserInDB(
-        user_id=user_id,
+    # OrgSettings
+    org_settings = OrganizationConfig(
+        org_id=int(org.id if org.id else 0),
+        config=org_config,
         creation_date=str(datetime.now()),
         update_date=str(datetime.now()),
-        orgs=orgs,
-        roles=roles,
-        **user_object.dict(),
     )
 
-    # Insert the user into the database
-    await users.insert_one(user.dict())
+    db_session.add(org_settings)
+    db_session.commit()
+    db_session.refresh(org_settings)
 
-    return User(**user.dict())
+    return org
 
 
-async def create_sample_data(org_slug: str, username: str, request: Request):
-    Faker(["en_US"])
-    fake_multilang = Faker(
-        ["en_US", "de_DE", "ja_JP", "es_ES", "it_IT", "pt_BR", "ar_PS"]
-    )
+def install_create_organization_user(
+    user_object: UserCreate, org_slug: str, db_session: Session
+):
+    user = User.model_validate(user_object)
 
-    users = request.app.db["users"]
-    orgs = request.app.db["organizations"]
-    user = await users.find_one({"username": username})
-    org = await orgs.find_one({"slug": org_slug.lower()})
-    user_id = user["user_id"]
-    org_id = org["org_id"]
+    # Complete the user object
+    user.user_uuid = f"user_{uuid4()}"
+    user.password = security_hash_password(user_object.password)
+    user.email_verified = False
+    user.creation_date = str(datetime.now())
+    user.update_date = str(datetime.now())
 
-    current_user = PublicUser(**user)
+    # Verifications
 
-    for i in range(0, 5):
-        # get image in BinaryIO format from unsplash and save it to disk
-        image = requests.get("https://source.unsplash.com/random/800x600")
-        with open("thumbnail.jpg", "wb") as f:
-            f.write(image.content)
+    # Check if Organization exists
+    statement = select(Organization).where(Organization.slug == org_slug)
+    org = db_session.exec(statement)
 
-        course_id = f"course_{uuid4()}"
-        course = CourseInDB(
-            name=fake_multilang.unique.sentence(),
-            description=fake_multilang.unique.text(),
-            mini_description=fake_multilang.unique.text(),
-            thumbnail="thumbnail",
-            org_id=org_id,
-            learnings=[fake_multilang.unique.sentence() for i in range(0, 5)],
-            public=True,
-            chapters=[],
-            course_id=course_id,
-            creationDate=str(datetime.now()),
-            updateDate=str(datetime.now()),
-            authors=[user_id],
-            chapters_content=[],
+    if not org.first():
+        raise HTTPException(
+            status_code=409,
+            detail="Organization does not exist",
         )
 
-        courses = request.app.db["courses"]
+    # Username
+    statement = select(User).where(User.username == user.username)
+    result = db_session.exec(statement)
 
-        course = CourseInDB(**course.dict())
-        await courses.insert_one(course.dict())
+    if result.first():
+        raise HTTPException(
+            status_code=409,
+            detail="Username already exists",
+        )
 
-        # create chapters
-        for i in range(0, 5):
-            coursechapter = CourseChapter(
-                name=fake_multilang.unique.sentence(),
-                description=fake_multilang.unique.text(),
-                activities=[],
-            )
-            coursechapter = await create_coursechapter(
-                request, coursechapter, course_id, current_user
-            )
-            if coursechapter:
-                # create activities
-                for i in range(0, 5):
-                    activity = Activity(
-                        name=fake_multilang.unique.sentence(),
-                        type="dynamic",
-                        content={},
-                    )
-                    activity = await create_activity(
-                        request,
-                        activity,
-                        org_id,
-                        coursechapter["coursechapter_id"],
-                        current_user,
-                    )
+    # Email
+    statement = select(User).where(User.email == user.email)
+    result = db_session.exec(statement)
+
+    if result.first():
+        raise HTTPException(
+            status_code=409,
+            detail="Email already exists",
+        )
+
+    # Exclude unset values
+    user_data = user.dict(exclude_unset=True)
+    for key, value in user_data.items():
+        setattr(user, key, value)
+
+    # Add user to database
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    # get org id
+    statement = select(Organization).where(Organization.slug == org_slug)
+    org = db_session.exec(statement)
+    org = org.first()
+    org_id = org.id if org else 0
+
+    # Link user and organization
+    user_organization = UserOrganization(
+        user_id=user.id if user.id else 0,
+        org_id=org_id or 0,
+        role_id=1,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+
+    db_session.add(user_organization)
+    db_session.commit()
+    db_session.refresh(user_organization)
+
+    user = UserRead.model_validate(user)
+
+    return user

@@ -1,14 +1,23 @@
-import "@styles/globals.css";
-import { Menu } from "@components/Objects/Menu/Menu";
-import AuthProvider from "@components/Security/AuthProvider";
+'use client'
+import '@styles/globals.css'
+import { SessionProvider } from 'next-auth/react'
+import Watermark from '@components/Objects/Watermark'
+import { OrgMenu } from '@components/Objects/Menus/OrgMenu'
 
-export default function RootLayout({ children, params }: { children: React.ReactNode , params :any}) {
+export default function RootLayout({
+  children,
+  params,
+}: {
+  children: React.ReactNode
+  params: any
+}) {
   return (
     <>
-      <AuthProvider>
-        <Menu orgslug={params?.orgslug}></Menu>
+      <SessionProvider>
+        <OrgMenu orgslug={params?.orgslug}></OrgMenu>
         {children}
-      </AuthProvider>
+        <Watermark />
+      </SessionProvider>
     </>
-  );
+  )
 }

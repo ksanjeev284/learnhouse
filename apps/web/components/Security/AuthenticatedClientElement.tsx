@@ -1,50 +1,82 @@
-'use client';
-import React from "react";
-import { AuthContext } from "./AuthProvider";
+'use client'
+import React from 'react'
+import { useLHSession } from '@components/Contexts/LHSessionContext'
+import { useOrg } from '@components/Contexts/OrgContext'
 
 interface AuthenticatedClientElementProps {
-    children: React.ReactNode;
-    checkMethod: 'authentication' | 'roles';
-    orgId?: string;
-
+  children: React.ReactNode
+  checkMethod: 'authentication' | 'roles'
+  orgId?: string
+  ressourceType?:
+  | 'collections'
+  | 'courses'
+  | 'activities'
+  | 'users'
+  | 'organizations'
+  action?: 'create' | 'update' | 'delete' | 'read'
 }
 
-export const AuthenticatedClientElement = (props: AuthenticatedClientElementProps) => {
-    const auth: any = React.useContext(AuthContext);
+export const AuthenticatedClientElement = (
+  props: AuthenticatedClientElementProps
+) => {
+  const [isAllowed, setIsAllowed] = React.useState(false)
+  const session = useLHSession() as any
+  const org = useOrg() as any
 
-    // Available roles 
-    const org_roles_values = ["admin", "owner"];
-    const user_roles_values = ["role_admin"];
-
-
-
-    function checkRoles() {
-        const org_id = props.orgId;
-        const org_roles = auth.userInfo.user_object.orgs;
-        const user_roles = auth.userInfo.user_object.roles;
-        const org_role = org_roles.find((org: any) => org.org_id == org_id);
-        const user_role = user_roles.find((role: any) => role.org_id == org_id);
-
-        if (org_role && user_role) {
-            if (org_roles_values.includes(org_role.org_role) || user_roles_values.includes(user_role.role_id)) {
-                return true;
-            }
-            else {
-                return false;
-            }
-        } else {
-            return false;
+  function isUserAllowed(
+    roles: any[],
+    action: string,
+    resourceType: string,
+    org_uuid: string
+  ): boolean {
+    // Iterate over the user's roles
+    for (const role of roles) {
+      // Check if the role is for the right organization
+      if (role.org.org_uuid === org_uuid) {
+        // Check if the user has the role for the resource type
+        if (role.role.rights && role.role.rights[resourceType]) {
+          // Check if the user is allowed to execute the action
+          const actionKey = `action_${action}`
+          if (role.role.rights[resourceType][actionKey] === true) {
+            return true
+          }
         }
+      }
     }
 
+    // If no role matches the organization, resource type, and action, return false
+    return false
+  }
 
-
-    if ((props.checkMethod == 'authentication' && auth.isAuthenticated) || (auth.isAuthenticated && props.checkMethod == 'roles' && checkRoles())) {
-        return <>{props.children}</>;
+  function check() {
+    if (session.status == 'unauthenticated') {
+      setIsAllowed(false)
+      return
+    } else {
+      if (props.checkMethod === 'authentication') {
+        setIsAllowed(session.status == 'authenticated')
+      } else if (props.checkMethod === 'roles' ) {
+        return setIsAllowed(
+          isUserAllowed(
+            session?.data?.roles,
+            props.action!,
+            props.ressourceType!,
+            org?.org_uuid
+          )
+        )
+      }
     }
-    return <></>;
+  }
 
+  React.useEffect(() => {
+    if (session.status == 'loading') {
+      return
+    }
 
+    check()
+  }, [session.data, org])
+
+  return <>{isAllowed && props.children}</>
 }
 
 export default AuthenticatedClientElement

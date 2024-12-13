@@ -1,413 +1,469 @@
-import json
-from typing import List, Literal, Optional
+from typing import Literal, List
 from uuid import uuid4
-from pydantic import BaseModel
+from sqlmodel import Session, select, or_, and_
+from src.db.usergroup_resources import UserGroupResource
+from src.db.usergroup_user import UserGroupUser
+from src.db.organizations import Organization
+from src.security.features_utils.usage import (
+    check_limits_with_usage,
+    decrease_feature_usage,
+    increase_feature_usage,
+)
+from src.services.trail.trail import get_user_trail_with_orgid
+from src.db.resource_authors import ResourceAuthor, ResourceAuthorshipEnum
+from src.db.users import PublicUser, AnonymousUser, User, UserRead
+from src.db.courses.courses import (
+    Course,
+    CourseCreate,
+    CourseRead,
+    CourseUpdate,
+    FullCourseReadWithTrail,
+)
 from src.security.rbac.rbac import (
-    authorization_verify_based_on_roles,
     authorization_verify_based_on_roles_and_authorship,
     authorization_verify_if_element_is_public,
     authorization_verify_if_user_is_anon,
 )
-from src.services.courses.activities.activities import ActivityInDB
 from src.services.courses.thumbnails import upload_thumbnail
-from src.services.users.schemas.users import AnonymousUser
-from src.services.users.users import PublicUser
-from fastapi import HTTPException, Request, status, UploadFile
+from fastapi import HTTPException, Request, UploadFile
 from datetime import datetime
 
-#### Classes ####################################################
 
-
-class Course(BaseModel):
-    name: str
-    mini_description: str
-    description: str
-    learnings: List[str]
-    thumbnail: str
-    public: bool
-    chapters: List[str]
-    chapters_content: Optional[List]
-    org_id: str
-
-
-class CourseInDB(Course):
-    course_id: str
-    creationDate: str
-    updateDate: str
-    authors: List[str]
-
-
-# TODO : wow terrible, fix this
-# those models need to be available only in the chapters service
-class CourseChapter(BaseModel):
-    name: str
-    description: str
-    activities: list
-
-
-class CourseChapterInDB(CourseChapter):
-    coursechapter_id: str
-    course_id: str
-    creationDate: str
-    updateDate: str
-
-
-#### Classes ####################################################
-
-# TODO : Add courses photo & cover upload and delete
-
-
-####################################################
-# CRUD
-####################################################
-
-
-async def get_course(request: Request, course_id: str, current_user: PublicUser):
-    courses = request.app.db["courses"]
-
-    course = await courses.find_one({"course_id": course_id})
-
-    # verify course rights
-    await verify_rights(request, course_id, current_user, "read")
+async def get_course(
+    request: Request,
+    course_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
+):
+    statement = select(Course).where(Course.course_uuid == course_uuid)
+    course = db_session.exec(statement).first()
 
     if not course:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
+            status_code=404,
+            detail="Course not found",
         )
 
-    course = Course(**course)
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "read", db_session)
+
+    # Get course authors
+    authors_statement = (
+        select(User)
+        .join(ResourceAuthor)
+        .where(ResourceAuthor.resource_uuid == course.course_uuid)
+    )
+    authors = db_session.exec(authors_statement).all()
+
+    # convert from User to UserRead
+    authors = [UserRead.model_validate(author) for author in authors]
+
+    course = CourseRead(**course.model_dump(), authors=authors)
+
     return course
 
 
-async def get_course_meta(request: Request, course_id: str, current_user: PublicUser):
-    courses = request.app.db["courses"]
-    trails = request.app.db["trails"]
-
-    course = await courses.find_one({"course_id": course_id})
-    activities = request.app.db["activities"]
-
-    # verify course rights
-    await verify_rights(request, course_id, current_user, "read")
+async def get_course_by_id(
+    request: Request,
+    course_id: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
+):
+    statement = select(Course).where(Course.id == course_id)
+    course = db_session.exec(statement).first()
 
     if not course:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
+            status_code=404,
+            detail="Course not found",
         )
 
-    coursechapters = await courses.find_one(
-        {"course_id": course_id}, {"chapters_content": 1, "_id": 0}
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "read", db_session)
+
+    # Get course authors
+    authors_statement = (
+        select(User)
+        .join(ResourceAuthor)
+        .where(ResourceAuthor.resource_uuid == course.course_uuid)
     )
+    authors = db_session.exec(authors_statement).all()
 
-    # activities
-    coursechapter_activityIds_global = []
+    # convert from User to UserRead
+    authors = [UserRead.model_validate(author) for author in authors]
 
-    # chapters
-    chapters = {}
-    if coursechapters["chapters_content"]:
-        for coursechapter in coursechapters["chapters_content"]:
-            coursechapter = CourseChapterInDB(**coursechapter)
-            coursechapter_activityIds = []
+    course = CourseRead(**course.model_dump(), authors=authors)
 
-            for activity in coursechapter.activities:
-                coursechapter_activityIds.append(activity)
-                coursechapter_activityIds_global.append(activity)
+    return course
 
-            chapters[coursechapter.coursechapter_id] = {
-                "id": coursechapter.coursechapter_id,
-                "name": coursechapter.name,
-                "activityIds": coursechapter_activityIds,
-            }
 
-    # activities
-    activities_list = {}
-    for activity in await activities.find(
-        {"activity_id": {"$in": coursechapter_activityIds_global}}
-    ).to_list(length=100):
-        activity = ActivityInDB(**activity)
-        activities_list[activity.activity_id] = {
-            "id": activity.activity_id,
-            "name": activity.name,
-            "type": activity.type,
-            "content": activity.content,
-        }
+async def get_course_meta(
+    request: Request,
+    course_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
+) -> FullCourseReadWithTrail:
+    # Avoid circular import
+    from src.services.courses.chapters import get_course_chapters
 
-    chapters_list_with_activities = []
-    for chapter in chapters:
-        chapters_list_with_activities.append(
-            {
-                "id": chapters[chapter]["id"],
-                "name": chapters[chapter]["name"],
-                "activities": [
-                    activities_list[activity]
-                    for activity in chapters[chapter]["activityIds"]
-                ],
-            }
+    course_statement = select(Course).where(Course.course_uuid == course_uuid)
+    course = db_session.exec(course_statement).first()
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found",
         )
-    course = CourseInDB(**course)
 
-    # Get activity by user
-    trail = await trails.find_one(
-        {"courses.course_id": course_id, "user_id": current_user.user_id}
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "read", db_session)
+
+    # Get course authors
+    authors_statement = (
+        select(User)
+        .join(ResourceAuthor)
+        .where(ResourceAuthor.resource_uuid == course.course_uuid)
     )
-    if trail:
-        # get only the course where course_id == course_id
-        trail_course = next(
-            (course for course in trail["courses"] if course["course_id"] == course_id),
-            None,
-        )
+    authors = db_session.exec(authors_statement).all()
+
+    # convert from User to UserRead
+    authors = [UserRead.model_validate(author) for author in authors]
+
+    course = CourseRead(**course.model_dump(), authors=authors)
+
+    # Get course chapters
+    chapters = await get_course_chapters(request, course.id, db_session, current_user)
+
+    # Trail
+    trail = None
+
+    if isinstance(current_user, AnonymousUser):
+        trail = None
     else:
-        trail_course = ""
+        trail = await get_user_trail_with_orgid(
+            request, current_user, course.org_id, db_session
+        )
 
-    return {
-        "course": course,
-        "chapters": chapters_list_with_activities,
-        "trail": trail_course,
-    }
+    return FullCourseReadWithTrail(
+        **course.model_dump(),
+        chapters=chapters,
+        trail=trail if trail else None,
+    )
+
+async def get_courses_orgslug(
+    request: Request,
+    current_user: PublicUser | AnonymousUser,
+    org_slug: str,
+    db_session: Session,
+    page: int = 1,
+    limit: int = 10,
+) -> List[CourseRead]:
+    offset = (page - 1) * limit
+
+    # Base query
+    query = (
+        select(Course)
+        .join(Organization)
+        .where(Organization.slug == org_slug)
+    )
+
+    if isinstance(current_user, AnonymousUser):
+        # For anonymous users, only show public courses
+        query = query.where(Course.public == True)
+    else:
+        # For authenticated users, show:
+        # 1. Public courses
+        # 2. Courses not in any UserGroup
+        # 3. Courses in UserGroups where the user is a member
+        # 4. Courses where the user is a resource author
+        query = (
+            query
+            .outerjoin(UserGroupResource, UserGroupResource.resource_uuid == Course.course_uuid)  # type: ignore
+            .outerjoin(UserGroupUser, and_(
+                UserGroupUser.usergroup_id == UserGroupResource.usergroup_id,
+                UserGroupUser.user_id == current_user.id
+            ))
+            .outerjoin(ResourceAuthor, ResourceAuthor.resource_uuid == Course.course_uuid)  # type: ignore
+            .where(or_(
+                Course.public == True,
+                UserGroupResource.resource_uuid == None,  # Courses not in any UserGroup # noqa: E711
+                UserGroupUser.user_id == current_user.id,  # Courses in UserGroups where user is a member
+                ResourceAuthor.user_id == current_user.id  # Courses where user is a resource author
+            ))
+        )
+
+    # Apply pagination
+    query = query.offset(offset).limit(limit).distinct()
+
+    courses = db_session.exec(query).all()
+
+    # Fetch authors for each course
+    course_reads = []
+    for course in courses:
+        authors_query = (
+            select(User)
+            .join(ResourceAuthor, ResourceAuthor.user_id == User.id)  # type: ignore
+            .where(ResourceAuthor.resource_uuid == course.course_uuid)
+        )
+        authors = db_session.exec(authors_query).all()
+        
+        course_read = CourseRead.model_validate(course)
+        course_read.authors = [UserRead.model_validate(author) for author in authors]
+        course_reads.append(course_read)
+
+    return course_reads
 
 
 async def create_course(
     request: Request,
-    course_object: Course,
-    org_id: str,
-    current_user: PublicUser,
+    org_id: int,
+    course_object: CourseCreate,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
     thumbnail_file: UploadFile | None = None,
 ):
-    courses = request.app.db["courses"]
-    users = request.app.db["users"]
-    user = await users.find_one({"user_id": current_user.user_id})
+    course = Course.model_validate(course_object)
 
-    # generate course_id with uuid4
-    course_id = str(f"course_{uuid4()}")
+    # RBAC check
+    await rbac_check(request, "course_x", current_user, "create", db_session)
 
-    # TODO(fix) : the implementation here is clearly not the best one (this entire function)
-    course_object.org_id = org_id
-    course_object.chapters_content = []
+    # Usage check
+    check_limits_with_usage("courses", org_id, db_session)
 
-    await authorization_verify_based_on_roles(
-        request,
-        current_user.user_id,
-        "create",
-        user["roles"],
-        course_id,
-    )
+    # Complete course object
+    course.org_id = course.org_id
 
+    # Get org uuid
+    org_statement = select(Organization).where(Organization.id == org_id)
+    org = db_session.exec(org_statement).first()
 
+    course.course_uuid = str(f"course_{uuid4()}")
+    course.creation_date = str(datetime.now())
+    course.update_date = str(datetime.now())
+
+    # Upload thumbnail
     if thumbnail_file and thumbnail_file.filename:
-        name_in_disk = (
-            f"{course_id}_thumbnail_{uuid4()}.{thumbnail_file.filename.split('.')[-1]}"
-        )
+        name_in_disk = f"{course.course_uuid}_thumbnail_{uuid4()}.{thumbnail_file.filename.split('.')[-1]}"
         await upload_thumbnail(
-            thumbnail_file, name_in_disk, course_object.org_id, course_id
+            thumbnail_file, name_in_disk, org.org_uuid, course.course_uuid  # type: ignore
         )
-        course_object.thumbnail = name_in_disk
+        course.thumbnail_image = name_in_disk
 
-    course = CourseInDB(
-        course_id=course_id,
-        authors=[current_user.user_id],
-        creationDate=str(datetime.now()),
-        updateDate=str(datetime.now()),
-        **course_object.dict(),
+    else:
+        course.thumbnail_image = ""
+
+    # Insert course
+    db_session.add(course)
+    db_session.commit()
+    db_session.refresh(course)
+
+    # Make the user the creator of the course
+    resource_author = ResourceAuthor(
+        resource_uuid=course.course_uuid,
+        user_id=current_user.id,
+        authorship=ResourceAuthorshipEnum.CREATOR,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
     )
 
-    course_in_db = await courses.insert_one(course.dict())
+    # Insert course author
+    db_session.add(resource_author)
+    db_session.commit()
+    db_session.refresh(resource_author)
 
-    if not course_in_db:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unavailable database",
-        )
+    # Get course authors
+    authors_statement = (
+        select(User)
+        .join(ResourceAuthor)
+        .where(ResourceAuthor.resource_uuid == course.course_uuid)
+    )
+    authors = db_session.exec(authors_statement).all()
 
-    return course.dict()
+    # Feature usage
+    increase_feature_usage("courses", course.org_id, db_session)
+
+    # convert from User to UserRead
+    authors = [UserRead.model_validate(author) for author in authors]
+
+    course = CourseRead(**course.model_dump(), authors=authors)
+
+    return CourseRead.model_validate(course)
 
 
 async def update_course_thumbnail(
     request: Request,
-    course_id: str,
-    current_user: PublicUser,
+    course_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
     thumbnail_file: UploadFile | None = None,
 ):
-    courses = request.app.db["courses"]
+    statement = select(Course).where(Course.course_uuid == course_uuid)
+    course = db_session.exec(statement).first()
 
-    course = await courses.find_one({"course_id": course_id})
-
-    # verify course rights
-    await verify_rights(request, course_id, current_user, "update")
-
-    # TODO(fix) : the implementation here is clearly not the best one
-    if course:
-        creationDate = course["creationDate"]
-        authors = course["authors"]
-        if thumbnail_file and thumbnail_file.filename:
-            name_in_disk = f"{course_id}_thumbnail_{uuid4()}.{thumbnail_file.filename.split('.')[-1]}"
-            course = Course(**course).copy(update={"thumbnail": name_in_disk})
-            await upload_thumbnail(
-                thumbnail_file, name_in_disk, course.org_id, course_id
-            )
-
-            updated_course = CourseInDB(
-                course_id=course_id,
-                creationDate=creationDate,
-                authors=authors,
-                updateDate=str(datetime.now()),
-                **course.dict(),
-            )
-
-            await courses.update_one(
-                {"course_id": course_id}, {"$set": updated_course.dict()}
-            )
-
-            return CourseInDB(**updated_course.dict())
-
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
-        )
-
-
-async def update_course(
-    request: Request, course_object: Course, course_id: str, current_user: PublicUser
-):
-    courses = request.app.db["courses"]
-
-    course = await courses.find_one({"course_id": course_id})
-
-    # verify course rights
-    await verify_rights(request, course_id, current_user, "update")
-
-    if course:
-        creationDate = course["creationDate"]
-        authors = course["authors"]
-
-        # get today's date
-        datetime_object = datetime.now()
-
-        updated_course = CourseInDB(
-            course_id=course_id,
-            creationDate=creationDate,
-            authors=authors,
-            updateDate=str(datetime_object),
-            **course_object.dict(),
-        )
-
-        await courses.update_one(
-            {"course_id": course_id}, {"$set": updated_course.dict()}
-        )
-
-        return CourseInDB(**updated_course.dict())
-
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
-        )
-
-
-async def delete_course(request: Request, course_id: str, current_user: PublicUser):
-    courses = request.app.db["courses"]
-
-    course = await courses.find_one({"course_id": course_id})
-
-    # verify course rights
-    await verify_rights(request, course_id, current_user, "delete")
+    name_in_disk = None
 
     if not course:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Course does not exist"
+            status_code=404,
+            detail="Course not found",
         )
 
-    isDeleted = await courses.delete_one({"course_id": course_id})
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "update", db_session)
 
-    if isDeleted:
-        return {"detail": "Course deleted"}
+    # Get org uuid
+    org_statement = select(Organization).where(Organization.id == course.org_id)
+    org = db_session.exec(org_statement).first()
+
+    # Upload thumbnail
+    if thumbnail_file and thumbnail_file.filename:
+        name_in_disk = f"{course_uuid}_thumbnail_{uuid4()}.{thumbnail_file.filename.split('.')[-1]}"
+        await upload_thumbnail(
+            thumbnail_file, name_in_disk, org.org_uuid, course.course_uuid  # type: ignore
+        )
+
+    # Update course
+    if name_in_disk:
+        course.thumbnail_image = name_in_disk
     else:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unavailable database",
+            status_code=500,
+            detail="Issue with thumbnail upload",
         )
 
+    # Complete the course object
+    course.update_date = str(datetime.now())
 
-####################################################
-# Misc
-####################################################
+    db_session.add(course)
+    db_session.commit()
+    db_session.refresh(course)
+
+    # Get course authors
+    authors_statement = (
+        select(User)
+        .join(ResourceAuthor)
+        .where(ResourceAuthor.resource_uuid == course.course_uuid)
+    )
+    authors = db_session.exec(authors_statement).all()
+
+    # convert from User to UserRead
+    authors = [UserRead.model_validate(author) for author in authors]
+
+    course = CourseRead(**course.model_dump(), authors=authors)
+
+    return course
 
 
-async def get_courses_orgslug(
+async def update_course(
     request: Request,
-    current_user: PublicUser,
-    page: int = 1,
-    limit: int = 10,
-    org_slug: str | None = None,
+    course_object: CourseUpdate,
+    course_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
 ):
-    courses = request.app.db["courses"]
-    orgs = request.app.db["organizations"]
+    statement = select(Course).where(Course.course_uuid == course_uuid)
+    course = db_session.exec(statement).first()
 
-    # get org_id from slug
-    org = await orgs.find_one({"slug": org_slug})
-
-    if not org:
+    if not course:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Organization does not exist"
+            status_code=404,
+            detail="Course not found",
         )
 
-    # show only public courses if user is not logged in
-    if current_user.user_id == "anonymous":
-        all_courses = (
-            courses.find({"org_id": org["org_id"], "public": True})
-            .sort("name", 1)
-            .skip(10 * (page - 1))
-            .limit(limit)
-        )
-    else:
-        all_courses = (
-            courses.find({"org_id": org["org_id"]})
-            .sort("name", 1)
-            .skip(10 * (page - 1))
-            .limit(limit)
-        )
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "update", db_session)
 
-    return [
-        json.loads(json.dumps(course, default=str))
-        for course in await all_courses.to_list(length=100)
-    ]
+    # Update only the fields that were passed in
+    for var, value in vars(course_object).items():
+        if value is not None:
+            setattr(course, var, value)
+
+    # Complete the course object
+    course.update_date = str(datetime.now())
+
+    db_session.add(course)
+    db_session.commit()
+    db_session.refresh(course)
+
+    # Get course authors
+    authors_statement = (
+        select(User)
+        .join(ResourceAuthor)
+        .where(ResourceAuthor.resource_uuid == course.course_uuid)
+    )
+    authors = db_session.exec(authors_statement).all()
+
+    # convert from User to UserRead
+    authors = [UserRead.model_validate(author) for author in authors]
+
+    course = CourseRead(**course.model_dump(), authors=authors)
+
+    return course
 
 
-#### Security ####################################################
-
-
-async def verify_rights(
+async def delete_course(
     request: Request,
-    course_id: str,
+    course_uuid: str,
+    current_user: PublicUser | AnonymousUser,
+    db_session: Session,
+):
+    statement = select(Course).where(Course.course_uuid == course_uuid)
+    course = db_session.exec(statement).first()
+
+    if not course:
+        raise HTTPException(
+            status_code=404,
+            detail="Course not found",
+        )
+
+    # RBAC check
+    await rbac_check(request, course.course_uuid, current_user, "delete", db_session)
+
+    # Feature usage
+    decrease_feature_usage("courses", course.org_id, db_session)
+
+    db_session.delete(course)
+    db_session.commit()
+
+    return {"detail": "Course deleted"}
+
+
+
+
+
+## 🔒 RBAC Utils ##
+
+
+async def rbac_check(
+    request: Request,
+    course_uuid: str,
     current_user: PublicUser | AnonymousUser,
     action: Literal["create", "read", "update", "delete"],
+    db_session: Session,
 ):
     if action == "read":
-        if current_user.user_id == "anonymous":
-            await authorization_verify_if_element_is_public(
-                request, course_id, current_user.user_id, action
+        if current_user.id == 0:  # Anonymous user
+            res = await authorization_verify_if_element_is_public(
+                request, course_uuid, action, db_session
             )
+            return res
         else:
-            users = request.app.db["users"]
-            user = await users.find_one({"user_id": current_user.user_id})
-
-            await authorization_verify_based_on_roles_and_authorship(
-                request,
-                current_user.user_id,
-                action,
-                user["roles"],
-                course_id,
+            res = (
+                await authorization_verify_based_on_roles_and_authorship(
+                    request, current_user.id, action, course_uuid, db_session
+                )
             )
+            return res
     else:
-        users = request.app.db["users"]
-        user = await users.find_one({"user_id": current_user.user_id})
-
-        await authorization_verify_if_user_is_anon(current_user.user_id)
+        await authorization_verify_if_user_is_anon(current_user.id)
 
         await authorization_verify_based_on_roles_and_authorship(
             request,
-            current_user.user_id,
+            current_user.id,
             action,
-            user["roles"],
-            course_id,
+            course_uuid,
+            db_session,
         )
 
 
-#### Security ####################################################
+## 🔒 RBAC Utils ##

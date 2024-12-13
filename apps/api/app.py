@@ -1,3 +1,4 @@
+import uvicorn
 from fastapi import FastAPI, Request
 from config.config import LearnHouseConfig, get_learnhouse_config
 from src.core.events.events import shutdown_app, startup_app
@@ -7,7 +8,6 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi_jwt_auth.exceptions import AuthJWTException
 from fastapi.middleware.gzip import GZipMiddleware
-
 
 
 # from src.services.mocks.initial import create_initial_data
@@ -25,8 +25,9 @@ learnhouse_config: LearnHouseConfig = get_learnhouse_config()
 app = FastAPI(
     title=learnhouse_config.site_name,
     description=learnhouse_config.site_description,
+    docs_url="/docs" if learnhouse_config.general_config.development_mode else None,
+    redoc_url="/redoc" if learnhouse_config.general_config.development_mode else None,
     version="0.1.0",
-    root_path="/",
 )
 
 app.add_middleware(
@@ -61,8 +62,17 @@ app.mount("/content", StaticFiles(directory="content"), name="content")
 # Global Routes
 app.include_router(v1_router)
 
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=learnhouse_config.hosting_config.port,
+        reload=learnhouse_config.general_config.development_mode,
+    )
+
+
 # General Routes
 @app.get("/")
 async def root():
     return {"Message": "Welcome to LearnHouse ✨"}
-
